@@ -12,6 +12,7 @@
 | 4. 每个任务可设置每天执行次数，达标后当天不再执行，零点全部重新计数 | `dailyLimit` + 当天计数器 `spent`；零点清零 |
 | 5. 界面显示在默认自动化任务的下方 | `sidebar.panellist` 注册 `id: automation-plus`、`order: 20`；官方自动化任务为 `schedules`、`order: 10` |
 | 6. 每次执行新建的会话以该任务标题命名 | 执行时在投递提示词**之前**调用 `sessionTitle.rename(agent.session, task.title)`，侧边栏与历史记录不再显示「未命名」 |
+| 7. 添加/编辑任务时可选择该任务使用哪个模型 | 任务编辑器里的「使用模型」下拉（数据来自 `llm.listProviders()` + `llm.listModels()`）；执行时在投递提示词**之前**调用 `sessionController.selectModel({ sessionId, provider, model })` |
 
 ## 界面
 
@@ -25,6 +26,10 @@
 - **`dailyLimit: 0`** 表示当天不执行该任务。
 - **禁用** 的任务（`enabled: false`）不参与循环，但保留在列表中。
 - **会话命名**：自动化提示词的 `source.kind` 是 `automation-plus` 而非 `user`，标题服务只会从 `user` 消息派生标题，因此插件在创建会话后显式 `sessionTitle.rename()` 写入任务标题——这也顺带把标题"钉住"，后续自动生成不会覆盖它。改名失败（缺少标题服务、标题为空、抛错）只记日志，绝不让执行失败。任务改名后，**已经跑过的会话保留当时的名字**。
+- **每个任务的模型**：任务可以钉住一个 `provider/model`，也可以留空表示"跟随部署默认"。钉住的模型在执行时被安装到该次新建的会话上，**第一轮就用它**。
+  - 钉住的模型解析失败（模型下线、provider 变更）→ 该次执行**失败**并把原因写进执行历史；静默换模型比报错更糟。
+  - 编辑器从部署默认自动写入的那一项会被标记为非钉住（`modelPinned: false`），它解析失败时只记警告并回落到会话默认——部署默认变了不该让任务失败。
+  - 注意一个**已知副作用**：DSH 的 `sessionController.selectModel()` 同时会把这次选择写回**部署默认模型**（这是该 API 自身的行为）。所以用某个任务指定模型跑一次后，新建会话的默认模型也会变成它；首次使用请留意这一点。
 
 ## Host HTTP 接口（前缀 `/automation-plus`）
 
@@ -33,6 +38,7 @@
 | GET | `/state` | 完整快照：任务、配额、运行时状态、下一个零点 |
 | GET | `/events` | SSE，状态变更时推送 revision |
 | GET | `/workspaces` | 工作区选择器数据 |
+| GET | `/models` | 按 provider 分组的可用模型（含部署默认模型、单个 provider 的失败信息） |
 | GET | `/history` | 执行历史 |
 | GET | `/health` | 存活与依赖自检（含宿主 `bootId`） |
 | GET | `/debug` | 路由/循环/订阅者自检（含宿主 `bootId`） |
@@ -86,5 +92,5 @@ DSH 把「分离异步工作产生的未处理 rejection」与「定时器/监�
 
 离线验证：
 
-- `dsh-plugins/harness/host-half.mjs`（宿主半部分：并发、配额、跨零点回绕、损坏状态、依赖缺失、web 载体缺席/迟到、`bootId` 每挂载一次都不同、会话命名及其失败降级，并断言零未处理 rejection）；
-- `dsh-plugins/harness/client-heal-probe.mjs`（客户端半部分：宿主换代只重载一次、重复轮询不排队第二次、持续 404 会耗尽预算后停止、重载后的新页面会接纳新宿主）。
+- `dsh-plugins/harness/host-half.mjs`（宿主半部分：并发、配额、跨零点回绕、损坏状态、依赖缺失、web 载体缺席/迟到、`bootId` 每挂载一次都不同、会话命名及其失败降级、模型目录与每任务模型选择及其失败分级，并断言零未处理 rejection）；
+- `dsh-plugins/harness/client-heal-probe.mjs`（客户端半部分：宿主换代只重载一次、重复轮询不排队第二次、持续 404 会耗尽预算后停止、重载后的新页面会接纳新宿主、模型目录只读一次且不进入轮询）。

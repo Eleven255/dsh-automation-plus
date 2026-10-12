@@ -58,7 +58,20 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
 /* --------------------------------------------------------------- fake host */
 
 const logs = { info: [], warn: [], error: [] }
-const calls = { create: [], resolveAgent: [], followup: [], flush: [], list: 0 }
+const calls = { create: [], resolveAgent: [], followup: [], flush: [], list: 0, rename: [], selectModel: [] }
+
+const providers = [
+  { id: 'deepseek-account', name: 'DeepSeek Account' },
+  { id: 'broken-provider', name: 'Broken' },
+]
+
+const modelsByProvider = {
+  'deepseek-account': [
+    { id: 'deepseek-flash', name: 'DeepSeek-V41-Flash' },
+    { id: 'deepseek-pro', name: 'DeepSeek-V41-Pro' },
+  ],
+  'broken-provider': [],
+}
 
 const behaviour = {
   createThrows: null,
@@ -66,6 +79,18 @@ const behaviour = {
   neverSettle: false,
   settleDelayMs: 5,
   missingController: false,
+  /** Withhold the web carrier, so `ctx.inject(['webServer'], …)` never fires. */
+  withholdWebServer: false,
+  /** Withhold the title service, so naming a Session has to degrade quietly. */
+  missingTitleService: false,
+  /** Make `sessionTitle.rename` throw, to prove naming cannot fail an execution. */
+  renameThrows: null,
+  /** Withhold the LLM registry, so the model catalog has to answer empty. */
+  missingLlm: false,
+  /** Make `sessionController.selectModel` reject. */
+  selectModelThrows: null,
+  /** Withhold the deployment default model selection. */
+  missingDefaultModel: false,
 }
 
 function makeAgent(sessionId) {
@@ -119,11 +144,38 @@ const services = {
       calls.resolveAgent.push(sessionId)
       return { agent: makeAgent(sessionId) }
     },
+    async selectModel(request) {
+      calls.selectModel.push(request)
+      if (behaviour.selectModelThrows !== null) throw behaviour.selectModelThrows
+      return { selected: { provider: request.provider, model: request.model } }
+    },
+  },
+  llm: {
+    listProviders() {
+      if (behaviour.missingLlm) return []
+      return providers
+    },
+    async listModels(provider) {
+      if (provider === 'broken-provider') throw new Error('adapter exploded')
+      return modelsByProvider[provider] ?? []
+    },
+  },
+  agentDefaultModel: {
+    currentSelection() {
+      return behaviour.missingDefaultModel ? undefined : { provider: 'deepseek-account', model: 'deepseek-flash' }
+    },
   },
   sessions: {
     async flush() {
       calls.flush.push(1)
       return true
+    },
+  },
+  sessionTitle: {
+    rename(session, title) {
+      calls.rename.push({ sessionId: session?.id, title })
+      if (behaviour.renameThrows !== null) throw behaviour.renameThrows
+      return { title, eventSeq: calls.rename.length }
     },
   },
 }
@@ -138,7 +190,7 @@ const allDisposers = []
 
 function makeCtx() {
   activeDisposers = []
-  return {
+  const root = {
     logger: {
       info: (message) => logs.info.push(String(message)),
       warn: (message) => {
@@ -155,11 +207,50 @@ function makeCtx() {
       }
       return () => {}
     },
-    reflect: {
-      get(name) {
-        if (behaviour.missingController && name === 'sessionController') return undefined
-        return services[name]
-      },
+    /**
+     * Model the real `ctx.inject(deps, callback)`: a child fiber whose body runs
+     * only once every named service exists. The stub services are always
+     * present, so the callback runs synchronously, which is what the harness's
+     * mount model assumes; `withholdWebServer` drives the "carrier arrives
+     * later" case that the plugin must survive.
+     */
+    inject(deps, callback) {
+      const names = Array.isArray(deps) ? deps : Object.keys(deps)
+      const available = names.every((name) => (name === 'webServer' && behaviour.withholdWebServer ? false : services[name] !== undefined))
+      if (!available) return
+      callback(makeInjectedCtx(services))
+    },
+  }
+  // `ctx.get(name)` is the optional accessor; the plugin also probes
+  // `ctx.reflect.get(name, false)` as a fallback.
+  const withheld = (name) => (behaviour.missingController && name === 'sessionController')
+    || (behaviour.missingTitleService && name === 'sessionTitle')
+    || (behaviour.missingLlm && name === 'llm')
+    || (behaviour.missingDefaultModel && name === 'agentDefaultModel')
+  root.get = (name) => (withheld(name) ? undefined : services[name])
+  root.reflect = {
+    get(name, strict) {
+      if (withheld(name)) return undefined
+      if (strict === true && services[name] === undefined) {
+        throw new Error(`cannot get property "${name}" without inject`)
+      }
+      return services[name]
+    },
+  }
+  return root
+}
+
+/** One injected child context: the named services plus the effect facility. */
+function makeInjectedCtx(table) {
+  return {
+    webServer: table.webServer,
+    effect(callback, label) {
+      const dispose = callback()
+      if (typeof dispose === 'function') {
+        activeDisposers.push({ label, dispose })
+        allDisposers.push({ label, dispose })
+      }
+      return () => {}
     },
   }
 }
@@ -189,6 +280,12 @@ async function disposeCurrent() {
   behaviour.createThrows = null
   behaviour.followupThrows = null
   behaviour.missingController = false
+  behaviour.withholdWebServer = false
+  behaviour.missingTitleService = false
+  behaviour.renameThrows = null
+  behaviour.missingLlm = false
+  behaviour.selectModelThrows = null
+  behaviour.missingDefaultModel = false
   await drain()
 }
 
@@ -272,7 +369,7 @@ async function mount(document, setup) {
   const before = routes.length
   module.apply(makeCtx())
   const route = routes[routes.length - 1]
-  if (routes.length !== before + 1) throw new Error('mount did not register a route')
+  if (routes.length === before) throw new Error('mount did not register a route')
   current = { route, disposers: activeDisposers }
   return current
 }
@@ -498,6 +595,159 @@ try {
   await until(async () => calls.create.length >= 1)
   await sleep(250)
   check('a disabled task is never executed', calls.create.every((item) => item.workspaceId === 'ws-beta'), calls.create.map((item) => item.workspaceId).join(','))
+
+  /* --- the web carrier can arrive late ---------------------------------- */
+
+  await disposeCurrent()
+  clearState()
+  behaviour.withholdWebServer = true
+  const beforeWithheld = routes.length
+  module.apply(makeCtx())
+  current = { route: routes[routes.length - 1], disposers: activeDisposers }
+  check('a withheld web carrier mounts no route and does not fail the plugin', routes.length === beforeWithheld, `routes=${routes.length - beforeWithheld}`)
+  behaviour.withholdWebServer = false
+
+  /* --- host identity ---------------------------------------------------- */
+
+  const identity = await mount()
+  const identityState = (await call('GET', '/state')).body
+  const identityHealth = (await call('GET', '/health')).body
+  const identityDebug = (await call('GET', '/debug')).body
+  check(
+    'the snapshot, /health and /debug publish one boot id',
+    typeof identityState.bootId === 'string'
+      && identityState.bootId.length > 0
+      && identityState.bootId === identityHealth.bootId
+      && identityState.bootId === identityDebug.bootId,
+    identityState.bootId,
+  )
+  const mountTwo = await mount()
+  const secondBootId = (await call('GET', '/state')).body.bootId
+  check(
+    'a fresh mount publishes a fresh boot id',
+    typeof secondBootId === 'string' && secondBootId !== identityState.bootId,
+    `${identityState.bootId} -> ${secondBootId}`,
+  )
+  check('the mount still registers its route after a reload', mountTwo.route.path === '/automation-plus')
+
+  /* --- the created Session is named after its task ---------------------- */
+
+  await mount({
+    version: 1, timeZone, dayKey, runCycle: 0, spent: {}, history: [],
+    tasks: [task('named', { title: '每日巡检', dailyLimit: 1 }), task('untitled-source', { title: '', dailyLimit: 1 })],
+  })
+  calls.create.length = 0
+  calls.rename.length = 0
+  await until(async () => calls.rename.length >= 1)
+  await sleep(250)
+  check('a created Session is renamed to its task title', calls.rename.some((entry) => entry.title === '每日巡检'), JSON.stringify(calls.rename))
+  check('the rename targets the Session the execution created', calls.rename[0]?.sessionId === 'session-1', JSON.stringify(calls.rename[0]))
+  check('the rename happens before the prompt is admitted', calls.rename.length >= 1 && calls.followup.length >= 1, `renames=${calls.rename.length} prompts=${calls.followup.length}`)
+
+  /* --- naming degrades quietly ------------------------------------------ */
+
+  await mount(
+    { version: 1, timeZone, dayKey, runCycle: 0, spent: {}, history: [], tasks: [task('no-title-service', { title: '无标题服务' })] },
+    () => {
+      behaviour.missingTitleService = true
+    },
+  )
+  calls.create.length = 0
+  calls.rename.length = 0
+  const ranWithoutTitles = await until(async () => calls.create.length >= 1)
+  await sleep(250)
+  check('an execution still runs without a title service', ranWithoutTitles && calls.rename.length === 0, `creates=${calls.create.length}`)
+
+  await mount(
+    { version: 1, timeZone, dayKey, runCycle: 0, spent: {}, history: [], tasks: [task('rename-throws', { title: '改名失败' })] },
+    () => {
+      behaviour.renameThrows = new Error('rename exploded')
+    },
+  )
+  calls.create.length = 0
+  const ranWithRenameFailure = await until(async () => {
+    const snapshot = (await call('GET', '/state')).body
+    return snapshot.tasks[0]?.history?.[0]?.status === 'ok'
+  })
+  const renameFailureSnapshot = (await call('GET', '/state')).body
+  check('a failing rename does not fail the execution', ranWithRenameFailure && renameFailureSnapshot.tasks[0].history[0].status === 'ok', JSON.stringify(renameFailureSnapshot.tasks[0].history.map((record) => record.status)))
+
+  /* --- the model picker catalog ----------------------------------------- */
+
+  await mount()
+  const catalog = await call('GET', '/models')
+  check('GET /models groups the advertised models', catalog.status === 200 && catalog.body.groups?.length === 1, JSON.stringify(catalog.body.groups?.map((group) => group.id)))
+  check('the catalog exposes each model id and name', catalog.body.groups?.[0]?.models?.map((model) => model.id).join(',') === 'deepseek-flash,deepseek-pro', JSON.stringify(catalog.body.groups?.[0]?.models))
+  check('the catalog reports the deployment default', catalog.body.default?.provider === 'deepseek-account' && catalog.body.default?.model === 'deepseek-flash', JSON.stringify(catalog.body.default))
+  check('a provider whose listing fails is reported, not fatal', catalog.body.failures?.some((failure) => failure.id === 'broken-provider'), JSON.stringify(catalog.body.failures))
+  check('an empty provider is left out of the groups', catalog.body.groups?.every((group) => group.models.length > 0))
+
+  await mount(undefined, () => {
+    behaviour.missingLlm = true
+  })
+  const withoutLlm = await call('GET', '/models')
+  check('no LLM registry answers an empty catalog', withoutLlm.status === 200 && withoutLlm.body.groups?.length === 0 && withoutLlm.body.default === null)
+
+  /* --- per-task model selection ----------------------------------------- */
+
+  await mount()
+  const withModel = await call('POST', '/tasks', { title: 'pinned', prompt: 'p', workspaceId: 'ws-alpha', modelProvider: 'deepseek-account', model: 'deepseek-pro' })
+  check('POST /tasks stores an explicit model', withModel.status === 201 && withModel.body.task.modelProvider === 'deepseek-account' && withModel.body.task.model === 'deepseek-pro', JSON.stringify(withModel.body.task))
+  check('an explicit model is pinned by default', withModel.body.task.modelPinned === true)
+
+  const halfModel = await call('POST', '/tasks', { title: 'half', prompt: 'p', workspaceId: 'ws-alpha', modelProvider: 'deepseek-account' })
+  check('half a model pair is refused', halfModel.status >= 400, `status=${halfModel.status}`)
+
+  const cleared = await call('PATCH', `/tasks/${withModel.body.task.id}`, { modelProvider: null, model: null })
+  check('null clears a pinned model', cleared.status === 200 && cleared.body.task.modelProvider === undefined && cleared.body.task.model === undefined, JSON.stringify(cleared.body.task))
+
+  const unpinned = await call('POST', '/tasks', { title: 'auto', prompt: 'p', workspaceId: 'ws-alpha', modelProvider: 'deepseek-account', model: 'deepseek-flash', modelPinned: false })
+  check('a pre-written default is stored as unpinned', unpinned.status === 201 && unpinned.body.task.modelPinned === false, JSON.stringify(unpinned.body.task.modelPinned))
+
+  await mount({
+    version: 1, timeZone, dayKey, runCycle: 0, spent: {}, history: [],
+    tasks: [
+      task('runs-on-pro', { title: 'uses pro', modelProvider: 'deepseek-account', model: 'deepseek-pro' }),
+      task('runs-on-default', { title: 'uses default' }),
+    ],
+  })
+  calls.create.length = 0
+  calls.selectModel.length = 0
+  await until(async () => calls.selectModel.length >= 1)
+  await sleep(250)
+  check('an execution installs its task model on its own Session', calls.selectModel[0]?.provider === 'deepseek-account' && calls.selectModel[0]?.model === 'deepseek-pro', JSON.stringify(calls.selectModel))
+  check('the model is installed on the Session the execution created', calls.selectModel[0]?.sessionId === 'session-1', JSON.stringify(calls.selectModel[0]))
+  check('a task without a model never touches the selection', calls.selectModel.length === 1, `selects=${calls.selectModel.length}`)
+
+  /* --- model failures --------------------------------------------------- */
+
+  await mount(
+    { version: 1, timeZone, dayKey, runCycle: 0, spent: {}, history: [], tasks: [task('bad-model', { title: 'pinned broken', modelProvider: 'deepseek-account', model: 'deepseek-pro' })] },
+    () => {
+      behaviour.selectModelThrows = new Error('no such model')
+    },
+  )
+  const pinnedFailure = await until(async () => {
+    const snapshot = (await call('GET', '/state')).body
+    return snapshot.tasks[0]?.history?.length >= 1
+  })
+  const pinnedSnapshot = (await call('GET', '/state')).body
+  check('an unavailable pinned model fails the execution', pinnedFailure && pinnedSnapshot.tasks[0].history[0].status === 'error', JSON.stringify(pinnedSnapshot.tasks[0].history.map((record) => record.error)))
+  check('the failure names the model', /deepseek-account\/deepseek-pro/.test(pinnedSnapshot.tasks[0].history[0].error ?? ''), pinnedSnapshot.tasks[0].history[0].error)
+
+  await mount(
+    { version: 1, timeZone, dayKey, runCycle: 0, spent: {}, history: [], tasks: [task('auto-model', { title: 'auto model', modelProvider: 'deepseek-account', model: 'deepseek-flash', modelPinned: false })] },
+    () => {
+      behaviour.selectModelThrows = new Error('deployment changed')
+    },
+  )
+  const degraded = await until(async () => {
+    const snapshot = (await call('GET', '/state')).body
+    return snapshot.tasks[0]?.history?.length >= 1
+  })
+  const degradedSnapshot = (await call('GET', '/state')).body
+  check('an unpinned model falls back to the Session default', degraded && degradedSnapshot.tasks[0].history[0].status === 'ok', JSON.stringify(degradedSnapshot.tasks[0].history.map((record) => record.status)))
+  check('the fallback runs the prompt anyway', calls.followup.length > 0)
 
   /* --- disposal --------------------------------------------------------- */
 

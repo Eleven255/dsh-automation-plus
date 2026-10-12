@@ -1,7 +1,7 @@
 {
   "name": "@deepseek-ai/dsh-automation-plus",
   "description": "Automation Plus: workspace-scoped sequential task automation with daily quotas for the DeepSeek Harness Web GUI",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "type": "module",
   "main": "lib/index.js",

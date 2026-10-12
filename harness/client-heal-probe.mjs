@@ -249,6 +249,44 @@ let recoveringStorage
   check('the panel keeps talking to the restarted host', recovered.ready === true && recovered.error === null && recovered.state?.bootId === 'boot-B', JSON.stringify({ ready: recovered.ready, error: recovered.error, bootId: recovered.state?.bootId }))
 }
 
+/* ---- 4. the model picker's API contract -------------------------------- */
+
+{
+  const page = installPageGlobals({ storage: new Map() })
+  const requests = []
+  globalThis.fetch = async (url, init) => {
+    requests.push({ url, method: init?.method ?? 'GET' })
+    if (url === '/automation-plus/models') {
+      return {
+        ok: true,
+        status: 200,
+        text: async () => JSON.stringify({
+          default: { provider: 'deepseek-account', model: 'deepseek-flash' },
+          groups: [{ id: 'deepseek-account', name: 'DeepSeek Account', models: [{ id: 'deepseek-flash', name: 'Flash' }, { id: 'deepseek-pro', name: 'Pro' }] }],
+          failures: [],
+        }),
+      }
+    }
+    return {
+      ok: true,
+      status: 200,
+      text: async () => JSON.stringify({ bootId: 'boot-A', revision: 1, tasks: [], runtime: { currentTaskId: null }, now: Date.now() }),
+    }
+  }
+
+  let store
+  const exports = await mountClient(page)
+  exports.apply(makeContext((value) => {
+    store = value
+  }))
+  await settle()
+
+  const models = store.getSnapshot().models
+  const catalogReads = requests.filter((request) => request.url === '/automation-plus/models').length
+  check('the store reads the provider/model catalog', models?.groups?.[0]?.models?.length === 2, JSON.stringify(models?.groups?.map((group) => group.id)))
+  check('the catalog is read once, not on the poll', catalogReads === 1, `reads=${catalogReads}`)
+}
+
 /* ----------------------------------------------------------------- verdict */
 
 Date.now = realNow
