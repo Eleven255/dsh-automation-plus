@@ -2,6 +2,8 @@
 
 本目录就是一个完整的 DSH 插件包（bundle），可以直接拷到别的机器安装。
 
+当前版本 **0.1.1**：新增宿主进程重启后的自愈（见文末「宿主重启」）。
+
 ```
 package.json          插件清单：声明 dsh.bundle.patch 与 dsh.client
 cordis.patch.yml      bundle 的 patch 层：把插件行插入根条目
@@ -79,3 +81,11 @@ powershell -ExecutionPolicy Bypass -File .\install.ps1 -DshHome D:\dsh -Profile 
 
 - 插件行由 bundle 层提供，不会写入 profile 的 `cordis.patch.yml`；因此应用对 `cordis.patch.yml` 的常规写入不会影响它（桌面端"原生致命恢复"也会保留依赖与文件，只需重新勾选启用）。
 - Host 半部分只从本包加载代码，不 import 任何 `@deepseek-ai/*` 包（DSH 只允许插件 import profile manifest 声明的依赖），因此它完全自包含。
+
+## 宿主重启（0.1.1 起）
+
+桌面版把 Web 宿主跑成子进程：宿主退出后应用会拉起一个新宿主，但**窗口页面不会重新加载**。此时页面里的插件 bundle 仍指向旧宿主的模块图，表现为面板停在「正在执行: undefined」并持续报「操作失败：HTTP 404」——旧 boot 的 `client.js?rev=…` 全部 404，而面板内存里还留着旧宿主的运行态。
+
+0.1.1 起插件自带自愈：宿主每次挂载生成一个 `bootId` 并随 `/state` 下发，页面一旦读到不同的 `bootId`（或 `/state` 持续 404）就自动重载窗口一次，按当前模块图重新 materialize。每个标签页的重载有预算（首次 1.2 秒、间隔至少 8 秒、最多 5 次），并且为触发它的那一代宿主登记，所以同一次重启只会重载一次；若重载后仍不行，则保留错误提示而不再反复刷新。
+
+手动应急仍然有效：按 `Ctrl+R` 重新加载窗口，或从插件页重新启用一次该 bundle。
