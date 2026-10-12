@@ -1,0 +1,6 @@
+# generated portable distribution (build-dist.ps1 output)
+dist/
+
+# local test scratch
+*.log
+node_modules/

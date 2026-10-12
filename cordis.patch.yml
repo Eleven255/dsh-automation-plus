@@ -1,0 +1,12 @@
+# Automation Plus bundle patch.
+#
+# A bundle layer lives outside the profile, so no app-driven write can drop this
+# row: the plugin manager owns the profile's `dsh.profile.bundles` entry, and the
+# profile's own cordis.patch.yml — which the desktop's native fatal recovery
+# backs up and recreates — is not involved.
+#
+# The row name is this package's own name, resolved from the profile's
+# node_modules where the bundle was installed.
+- insert:
+    - id: automation-plus
+      name: "@deepseek-ai/dsh-automation-plus"

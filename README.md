@@ -1,0 +1,68 @@
+# Automation Plus（自动化 Plus）
+
+在 DeepSeek Harness Web GUI 中按工作区串行执行任务的自动化插件。
+
+## 功能
+
+| 需求 | 实现 |
+|---|---|
+| 1. 可添加/修改/删除任务，可指定工作区，每次执行在该工作区**新建会话** | 「自动化 Plus」面板内的任务编辑器；每次执行调用 `sessionController.create({ workspaceId })` 新建会话后再投递提示词 |
+| 2. 任务逐个执行，最后一个任务执行完后回到任务 1 | 单一执行队列 `enqueueExecution`，任意时刻只有一个执行在跑；`nextRunnableTask()` 总是取第一个仍有配额的任务，因此到末尾自动回绕 |
+| 3. 每天零点从任务 1 开始，正在执行的任务先执行完 | 循环每轮开头 `rollDayIfNeeded()`；跨零点的执行会先被 `await` 完成，之后再重置并从第一个任务开始 |
+| 4. 每个任务可设置每天执行次数，达标后当天不再执行，零点全部重新计数 | `dailyLimit` + 当天计数器 `spent`；零点清零 |
+| 5. 界面显示在默认自动化任务的下方 | `sidebar.panellist` 注册 `id: automation-plus`、`order: 20`；官方自动化任务为 `schedules`、`order: 10` |
+
+## 界面
+
+- 侧边栏图标「自动化 Plus」位于官方「自动化」下方，对应独立的 `main` 面板（key `automation-plus`）。
+- 面板顶部可启停循环、刷新、新建任务；列表显示每个任务的顺序、配额、剩余次数与最近执行记录。
+- 「立即执行一次」与循环共用同一执行槽：有执行在跑时会返回 409 并拒绝，保证永不并发。
+
+## 语义说明
+
+- **执行次数计数**：无论成功、失败还是超时，都会消耗一次当日配额。这是刻意的——否则失败任务会立刻无限重试。失败原因记录在执行历史中。
+- **`dailyLimit: 0`** 表示当天不执行该任务。
+- **禁用** 的任务（`enabled: false`）不参与循环，但保留在列表中。
+
+## Host HTTP 接口（前缀 `/automation-plus`）
+
+| 方法 | 路径 | 说明 |
+|---|---|---|
+| GET | `/state` | 完整快照：任务、配额、运行时状态、下一个零点 |
+| GET | `/events` | SSE，状态变更时推送 revision |
+| GET | `/workspaces` | 工作区选择器数据 |
+| GET | `/history` | 执行历史 |
+| GET | `/health` | 存活与依赖自检 |
+| POST | `/tasks` | 新建任务 |
+| PATCH | `/tasks/:id` | 修改任务 |
+| DELETE | `/tasks/:id` | 删除任务 |
+| POST | `/tasks/:id/move` | 调整顺序（`position` 从 1 开始） |
+| POST | `/tasks/:id/run` | 立即执行一次；有执行在跑时返回 `409 execution_in_progress` |
+| POST | `/run` | 循环总开关（`{enabled:boolean}`） |
+
+## 状态存储
+
+`$DSH_HOME/storages/automation-plus.json`（原子写入）。损坏的文档会被重命名为 `.corrupt-<ts>` 并重新开始。
+
+## 安装形态与更新
+
+本包是一个 **bundle**：`package.json` 声明 `dsh.bundle.patch`，`cordis.patch.yml` 插入插件行。启用状态保存在 profile 的 `package.json`（`dependencies` + `dsh.profile.bundles`），因此不会被应用自身对 `cordis.patch.yml` 的常规写入影响。
+
+改代码后同步到已安装路径（pnpm 使用 `link:`，同步即生效）：
+
+```powershell
+& "D:\Program Files\deepseek\dsh-plugins\sync.ps1"
+```
+
+启用/停用：设置里的插件页，或 `plugin_manager` 的 `set_bundle`。
+
+## 安全约定（重要）
+
+DSH 把「分离异步工作产生的未处理 rejection」与「定时器/监听器抛出的未捕获异常」视为**整个 Host 进程的致命错误**。因此本插件的宿主半部分：
+
+- 调度循环的 promise 带终结 `catch`，永不 reject 到进程；
+- `wake()` 只调用已确认是函数的 resolver（历史缺陷：`null !== undefined` 为真导致调用 `null`，在停用/重载时抛错并拖垮进程）；
+- 所有 dispose 处理器内部捕获异常；
+- 每次执行的所有失败都记录为执行记录，不外泄。
+
+离线验证：`dsh-plugins/harness/host-half.mjs`（宿主半部分，含并发、配额、跨零点回绕、损坏状态、依赖缺失等用例，并断言零未处理 rejection）。
